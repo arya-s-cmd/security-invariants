@@ -1,0 +1,237 @@
+diff --git a/app/main.py b/app/main.py
+index 3d2b8aa..f7b2c10 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -1,18 +1,22 @@
+ from __future__ import annotations
+ 
+ import os
++import time
+ from dataclasses import dataclass
+ from typing import Optional
++from collections import defaultdict, deque
+ 
+-from fastapi import FastAPI, Header, HTTPException, status
++from fastapi import FastAPI, Header, HTTPException, status, Request
+ from fastapi.middleware.cors import CORSMiddleware
+ from pydantic import BaseModel
+ 
+ 
+ # ---- Auth model (simple on purpose, good enough for invariants testing) ----
+ 
+ @dataclass(frozen=True)
+ class Principal:
+     role: str
+     subject: str
+ 
+ 
+ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "admin-token")
+ USER_TOKEN = os.getenv("USER_TOKEN", "user-token")
+ 
+ ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
+ ALLOW_CREDENTIALS = os.getenv("ALLOW_CREDENTIALS", "false").lower() == "true"
+ 
++RATE_LIMIT_WINDOW_SEC = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
++RATE_LIMIT_MAX_FAILS = int(os.getenv("RATE_LIMIT_MAX_FAILS", "10"))
++_failed_auth: dict[str, deque[float]] = defaultdict(deque)
++
++def _client_ip(req: Request) -> str:
++    xff = req.headers.get("x-forwarded-for")
++    if xff:
++        return xff.split(",")[0].strip()
++    return req.client.host if req.client else "unknown"
++
++def _rate_limit_check(req: Request) -> None:
++    ip = _client_ip(req)
++    now = time.time()
++    q = _failed_auth[ip]
++    cutoff = now - RATE_LIMIT_WINDOW_SEC
++    while q and q[0] < cutoff:
++        q.popleft()
++    if len(q) >= RATE_LIMIT_MAX_FAILS:
++        raise HTTPException(status_code=429, detail="too many auth failures, slow down")
++
++def _record_auth_failure(req: Request) -> None:
++    ip = _client_ip(req)
++    _failed_auth[ip].append(time.time())
++
+ 
+ def _principal_from_auth(authorization: Optional[str]) -> Optional[Principal]:
+     if not authorization:
+         return None
+     if not authorization.startswith("Bearer "):
+         return None
+     token = authorization.removeprefix("Bearer ").strip()
+     if token == ADMIN_TOKEN:
+         return Principal(role="admin", subject="admin@example.com")
+     if token == USER_TOKEN:
+         return Principal(role="user", subject="user@example.com")
+     return None
+ 
+ 
+-def require_auth(p: Optional[Principal]) -> Principal:
+-    if not p:
+-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing/invalid token")
+-    return p
++def require_auth(req: Request, p: Optional[Principal]) -> Principal:
++    _rate_limit_check(req)
++    if not p:
++        _record_auth_failure(req)
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing/invalid token")
++    return p
+ 
+ 
+ def require_admin(p: Principal) -> None:
+     if p.role != "admin":
+         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin required")
+@@ -62,31 +66,31 @@ class ItemIn(BaseModel):
+ def health():
+     return {"ok": True }
+ 
+ 
+ @app.get("/me")
+-def me(authorization: Optional[str] = Header(default=None)):
+-    p = require_auth(_principal_from_auth(authorization))
++def me(request: Request, authorization: Optional[str] = Header(default=None)):
++    p = require_auth(request, _principal_from_auth(authorization))
+     return {"subject": p.subject, "role": p.role}
+ 
+ 
+ @app.post("/items")
+-def create_item(payload: ItemIn, authorization: Optional[str] = Header(default=None)):
+-    p = require_auth(_principal_from_auth(authorization))
++def create_item(request: Request, payload: ItemIn, authorization: Optional[str] = Header(default=None)):
++    p = require_auth(request, _principal_from_auth(authorization))
+     # pretend we saved it
+     return {"id": "item_1", "owner": p.subject, "name": payload.name}
+ 
+ 
+ @app.get("/admin/secret")
+-def admin_secret(authorization: Optional[str] = Header(default=None)):
+-    p = require_auth(_principal_from_auth(authorization))
++def admin_secret(request: Request, authorization: Optional[str] = Header(default=None)):
++    p = require_auth(request, _principal_from_auth(authorization))
+     require_admin(p)
+     return {"secret": "TOP_SECRET_VALUE"}
+ 
+ 
+ @app.get("/pii")
+-def pii(authorization: Optional[str] = Header(default=None)):
++def pii(request: Request, authorization: Optional[str] = Header(default=None)):
+     # should never leak PII to unauth
++    _rate_limit_check(request)
+     p = _principal_from_auth(authorization)
+     if not p:
++        _record_auth_failure(request)
+         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing/invalid token")
+     # only admin sees extra PII fields
+     base = {"subject": p.subject, "role": p.role}
+     if p.role == "admin":
+         base.update({"email": p.subject, "phone": "+1-555-0100"})
+     return base
+diff --git a/invariants/runner.py b/invariants/runner.py
+index 8f3a9c1..9e27c13 100644
+--- a/invariants/runner.py
++++ b/invariants/runner.py
+@@ -1,15 +1,16 @@
+ from __future__ import annotations
+ 
+ import importlib
+ from dataclasses import dataclass
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+ import httpx
+ import yaml
+ 
+ from invariants.checks import (
+     check_cors_not_wildcard_with_credentials,
+     check_no_sensitive_fields_for_unauth,
+     check_write_requires_auth,
+ )
+ 
+@@ -20,6 +21,24 @@ class Finding:
+     check: str
+     severity: str
+     message: str
+     evidence: Dict[str, Any]
+ 
++async def _check_rate_limit_on_auth_failures(
++    client: httpx.AsyncClient,
++    cfg: Dict[str, Any],
++) -> List[Finding]:
++    """
++    After N unauth requests to a protected route, server should start returning 429.
++    This is a pragmatic brute-force protection invariant.
++    """
++    path = cfg.get("path", "/me")
++    attempts = int(cfg.get("attempts", 12))
++    expect_status = int(cfg.get("expect_status", 429))
++
++    last_status: Optional[int] = None
++    for _ in range(attempts):
++        r = await client.get(path)  # intentionally unauth
++        last_status = r.status_code
++
++    if last_status != expect_status:
++        return [Finding(
++            check="rate_limit_on_auth_failures",
++            severity="MEDIUM",
++            message=f"Expected {expect_status} after {attempts} unauth requests to {path}, got {last_status}",
++            evidence={"path": path, "attempts": attempts, "last_status": last_status},
++        )]
++    return []
++
+ def load_config(path: str) -> Dict[str, Any]:
+     with open(path, "r", encoding="utf-8") as f:
+         return yaml.safe_load(f)
+ 
+@@ -60,6 +79,7 @@ async def run_all(config_path: str = "invariants.yml", base_url: Optional[str] =
+     write_eps = cfg.get("write_endpoints", [])
+     cors_cfg = cfg.get("cors", {})
+     admin_paths = cfg.get("admin_paths", [])
++    rate_limit_cfg = cfg.get("rate_limit", {})
+ 
+     findings: List[Finding] = []
+ 
+@@ -95,6 +115,9 @@ async def run_all(config_path: str = "invariants.yml", base_url: Optional[str] =
+         findings += await check_write_requires_auth(client, write_eps, user_token=user_token, auth_header=auth_header)
+         findings += await check_no_sensitive_fields_for_unauth(client, sensitive_fields)
+         findings += await check_cors_not_wildcard_with_credentials(client, cors_cfg)
++        if rate_limit_cfg:
++            findings += await _check_rate_limit_on_auth_failures(client, rate_limit_cfg)
+ 
+     return findings
+diff --git a/invariants.yml b/invariants.yml
+index 0c82b77..2f0a2cc 100644
+--- a/invariants.yml
++++ b/invariants.yml
+@@ -1,26 +1,33 @@
+ target:
+   app: "app.main:app"
+ 
+ auth:
+   header: "Authorization"
+   admin_token: "admin-token"
+   user_token: "user-token"
+ 
+ sensitive_fields:
+   - email
+   - phone
+   - secret
+   - token
+   - password
+ 
+ write_endpoints:
+   - method: POST
+     path: /items
+ 
+ cors:
+   disallow_wildcard_with_credentials: true
+ 
+ admin_paths:
+   - /admin/secret
++
++rate_limit:
++  path: /me
++  attempts: 12
++  expect_status: 429

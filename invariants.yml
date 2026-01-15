@@ -23,4 +23,7 @@ cors:
 admin_paths:
   - /admin/secret
 
-
+rate_limit:
+  path: /me
+  attempts: 12
+  expect_status: 429

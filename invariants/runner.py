@@ -85,6 +85,30 @@ def discover_endpoints(openapi: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+async def _check_rate_limit_on_auth_failures(
+    client: httpx.AsyncClient,
+    cfg: Dict[str, Any],
+) -> List[Finding]:
+    """After N unauth requests to a protected route, server should start returning 429."""
+    path = cfg.get("path", "/me")
+    attempts = int(cfg.get("attempts", 12))
+    expect_status = int(cfg.get("expect_status", 429))
+
+    last_status: Optional[int] = None
+    for _ in range(attempts):
+        r = await client.get(path)  # intentionally unauth
+        last_status = r.status_code
+
+    if last_status != expect_status:
+        return [Finding(
+            check="rate_limit_on_auth_failures",
+            severity="MEDIUM",
+            message=f"Expected {expect_status} after {attempts} unauth requests to {path}, got {last_status}",
+            evidence={"path": path, "attempts": attempts, "last_status": last_status},
+        )]
+    return []
+
 async def run_all(config_path: str = "invariants.yml", base_url: Optional[str] = None) -> List[Finding]:
     cfg = load_config(config_path)
     validate_config(cfg)
@@ -96,6 +120,7 @@ async def run_all(config_path: str = "invariants.yml", base_url: Optional[str] =
     auth_header = cfg.get("auth", {}).get("header", "Authorization")
     sensitive_fields = cfg.get("sensitive_fields", [])
     cors_cfg = cfg.get("cors", {})
+    rate_limit_cfg = cfg.get("rate_limit", {})
 
     # Two modes:
     # 1) In-process ASGI (fast tests): base_url is None
@@ -125,6 +150,8 @@ async def run_all(config_path: str = "invariants.yml", base_url: Optional[str] =
             findings += await check_admin_routes_require_admin(client, admin_paths, user_token=user_token, auth_header=auth_header)
             findings += await check_admin_routes_accessible_to_admin(client, admin_paths, admin_token=admin_token, auth_header=auth_header)
             findings += await check_cors_not_wildcard_with_credentials(client, cors_cfg)
+        if rate_limit_cfg:
+            findings += await _check_rate_limit_on_auth_failures(client, rate_limit_cfg)
             return findings
 
 
