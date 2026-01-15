@@ -18,3 +18,6 @@ write_endpoints:
 
 cors:
   disallow_wildcard_with_credentials: true
+
+admin_paths:
+  - /admin/secret
