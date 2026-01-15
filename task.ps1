@@ -1,4 +1,4 @@
-﻿param(
+param(
   [ValidateSet("check","test","run")]
   [string]$Task = "check"
 )
@@ -20,7 +20,6 @@ if ($Task -eq "test") {
   exit 0
 }
 
-# check: full gate
 Run-Cmd "python -m compileall app invariants"
 Run-Cmd "pytest -q"
 Run-Cmd "python -m invariants.cli -c invariants.yml"

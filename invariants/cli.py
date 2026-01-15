@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
@@ -11,15 +11,29 @@ from invariants.runner import run_all
 
 console = Console()
 
+
 def main(
     config: str = typer.Option("invariants.yml", "--config", "-c", help="Path to invariants.yml"),
+    json_out: bool = typer.Option(False, "--json", help="Emit findings as JSON"),
 ):
-    """Run all security invariants and exit non-zero on failures."""
-    findings = asyncio.run(run_all(config))
+    """Run security invariants and exit non-zero on failures."""
+    try:
+        findings = asyncio.run(run_all(config))
+    except Exception as e:
+        console.print(f"[bold red] Runner crashed[/bold red]: {e}")
+        raise typer.Exit(code=2)
 
     if not findings:
-        console.print("[bold green]✅ All invariants passed[/bold green]")
+        console.print("[bold green] All invariants passed[/bold green]")
         raise typer.Exit(code=0)
+
+    if json_out:
+        payload = [
+            {"severity": f.severity, "check": f.check, "message": f.message, "evidence": f.evidence}
+            for f in findings
+        ]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        raise typer.Exit(code=1)
 
     table = Table(title="Invariant Failures")
     table.add_column("Severity", style="bold")
@@ -37,6 +51,7 @@ def main(
 
     console.print(table)
     raise typer.Exit(code=1)
+
 
 if __name__ == "__main__":
     typer.run(main)

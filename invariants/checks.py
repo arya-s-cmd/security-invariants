@@ -14,14 +14,28 @@ class Finding:
     evidence: Optional[Dict[str, Any]] = None
 
 
-async def check_write_requires_auth(client: httpx.AsyncClient, write_endpoints: List[Dict[str, str]]) -> List[Finding]:
+def safe_json(resp: httpx.Response):
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+async def check_write_requires_auth(
+    client: httpx.AsyncClient,
+    write_endpoints: List[Dict[str, str]],
+    user_token: str,
+) -> List[Finding]:
     findings: List[Finding] = []
+
     for ep in write_endpoints:
         method = ep["method"].upper()
         path = ep["path"]
 
-        # Try unauth write
-        resp = await client.request(method, path, json={"name": "x", "note": "y"})
+        payload = {"name": "x", "note": "y"}
+
+        # Unauth write should be blocked
+        resp = await client.request(method, path, json=payload)
         if resp.status_code not in (401, 403):
             findings.append(
                 Finding(
@@ -31,25 +45,42 @@ async def check_write_requires_auth(client: httpx.AsyncClient, write_endpoints: 
                     evidence={"status_code": resp.status_code, "body": safe_json(resp)},
                 )
             )
+
+        # Auth sanity: user token should not be ignored (401 means auth wiring broken)
+        resp2 = await client.request(
+            method,
+            path,
+            json=payload,
+            headers={"Authorization": f"Bearer {user_token}"},
+        )
+        if resp2.status_code == 401:
+            findings.append(
+                Finding(
+                    check="auth_header_effective",
+                    severity="MEDIUM",
+                    message=f"{method} {path} still returns 401 even with user token",
+                    evidence={"status_code": resp2.status_code, "body": safe_json(resp2)},
+                )
+            )
+
     return findings
 
 
-async def check_no_sensitive_fields_for_unauth(client: httpx.AsyncClient, sensitive_fields: List[str]) -> List[Finding]:
+async def check_no_sensitive_fields_for_unauth(
+    client: httpx.AsyncClient,
+    sensitive_fields: List[str],
+    scan_paths: List[str],
+) -> List[Finding]:
     findings: List[Finding] = []
 
-    # Crawl a small known set (keep simple for v0)
-    candidates = ["/health", "/me", "/pii", "/admin/secret"]
-
-    for path in candidates:
+    for path in scan_paths:
         resp = await client.get(path)  # unauth
 
-        # Only inspect bodies that returned successfully.
-        # Error messages often contain words like "token" and that alone is not a data leak.
+        # Only inspect success bodies; error strings often include words like "token"
         if resp.status_code < 200 or resp.status_code >= 300:
             continue
 
         body_text = resp.text.lower()
-
         for field in sensitive_fields:
             if field.lower() in body_text:
                 findings.append(
@@ -64,40 +95,80 @@ async def check_no_sensitive_fields_for_unauth(client: httpx.AsyncClient, sensit
     return findings
 
 
-async def check_cors_not_wildcard_with_credentials(client: httpx.AsyncClient, cors_cfg: Dict[str, Any]) -> List[Finding]:
-    """
-    Security rule: If Access-Control-Allow-Credentials:true, then Access-Control-Allow-Origin must not be '*'
-    """
+async def check_cors_not_wildcard_with_credentials(
+    client: httpx.AsyncClient,
+    cors_cfg: Dict[str, Any],
+) -> List[Finding]:
     findings: List[Finding] = []
+
     if not cors_cfg.get("disallow_wildcard_with_credentials", True):
         return findings
 
-    # preflight
-    resp = await client.options(
-        "/health",
-        headers={
-            "Origin": "http://evil.example",
-            "Access-Control-Request-Method": "GET",
-        },
-    )
-    acao = resp.headers.get("access-control-allow-origin", "")
-    accred = resp.headers.get("access-control-allow-credentials", "").lower()
+    # Preflight-like probe (simple heuristic)
+    headers = {
+        "Origin": "http://evil.example",
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization",
+    }
+    resp = await client.options("/health", headers=headers)
 
-    if accred == "true" and acao.strip() == "*":
+    allow_origin = resp.headers.get("access-control-allow-origin")
+    allow_creds = resp.headers.get("access-control-allow-credentials")
+
+    if allow_creds and allow_creds.lower() == "true" and allow_origin == "*":
         findings.append(
             Finding(
-                check="cors_wildcard_with_credentials",
+                check="cors_not_wildcard_with_credentials",
                 severity="HIGH",
-                message="CORS misconfig: allow-credentials true with wildcard origin",
-                evidence={"acao": acao, "accred": accred},
+                message="CORS allows credentials with wildcard origin",
+                evidence={"allow_origin": allow_origin, "allow_creds": allow_creds},
             )
         )
 
     return findings
 
 
-def safe_json(resp: httpx.Response):
-    try:
-        return resp.json()
-    except Exception:
-        return None
+async def check_admin_routes_require_admin(
+    client: httpx.AsyncClient,
+    admin_paths: List[str],
+    user_token: str,
+) -> List[Finding]:
+    findings: List[Finding] = []
+    headers = {"Authorization": f"Bearer {user_token}"}
+
+    for path in admin_paths:
+        resp = await client.get(path, headers=headers)
+        if resp.status_code != 403:
+            findings.append(
+                Finding(
+                    check="admin_routes_require_admin",
+                    severity="HIGH",
+                    message=f"Non-admin user could access {path} (expected 403)",
+                    evidence={"status_code": resp.status_code, "body": safe_json(resp)},
+                )
+            )
+
+    return findings
+
+
+async def check_admin_routes_accessible_to_admin(
+    client: httpx.AsyncClient,
+    admin_paths: List[str],
+    admin_token: str,
+) -> List[Finding]:
+    findings: List[Finding] = []
+    headers = {"Authorization": f"Bearer {admin_token}"}
+
+    for path in admin_paths:
+        resp = await client.get(path, headers=headers)
+        if resp.status_code == 401:
+            findings.append(
+                Finding(
+                    check="admin_accessible_to_admin",
+                    severity="MEDIUM",
+                    message=f"Admin token got 401 on {path} (auth wiring likely broken)",
+                    evidence={"status_code": resp.status_code, "body": safe_json(resp)},
+                )
+            )
+
+    return findings
