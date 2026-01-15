@@ -2,6 +2,7 @@ target:
   app: "app.main:app"
 
 auth:
+  header: "Authorization"
   admin_token: "admin-token"
   user_token: "user-token"
 
@@ -21,3 +22,5 @@ cors:
 
 admin_paths:
   - /admin/secret
+
+

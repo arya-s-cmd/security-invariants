@@ -15,10 +15,11 @@ console = Console()
 def main(
     config: str = typer.Option("invariants.yml", "--config", "-c", help="Path to invariants.yml"),
     json_out: bool = typer.Option(False, "--json", help="Emit findings as JSON"),
+    base_url: str = typer.Option("", "--base-url", help="Run against a live server URL (e.g. http://127.0.0.1:8000)"),
 ):
     """Run security invariants and exit non-zero on failures."""
     try:
-        findings = asyncio.run(run_all(config))
+        findings = asyncio.run(run_all(config, base_url=base_url.strip() or None))
     except Exception as e:
         console.print(f"[bold red] Runner crashed[/bold red]: {e}")
         raise typer.Exit(code=2)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 import yaml
@@ -85,7 +85,7 @@ def discover_endpoints(openapi: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-async def run_all(config_path: str = "invariants.yml") -> List[Finding]:
+async def run_all(config_path: str = "invariants.yml", base_url: Optional[str] = None) -> List[Finding]:
     cfg = load_config(config_path)
     validate_config(cfg)
 
@@ -93,12 +93,44 @@ async def run_all(config_path: str = "invariants.yml") -> List[Finding]:
 
     admin_token = cfg["auth"]["admin_token"]
     user_token = cfg["auth"]["user_token"]
+    auth_header = cfg.get("auth", {}).get("header", "Authorization")
     sensitive_fields = cfg.get("sensitive_fields", [])
     cors_cfg = cfg.get("cors", {})
 
+    # Two modes:
+    # 1) In-process ASGI (fast tests): base_url is None
+    # 2) Live server over HTTP (realistic): base_url provided
+    if base_url:
+        bu = base_url.rstrip("/")
+        async with httpx.AsyncClient(base_url=bu, timeout=15.0, follow_redirects=True) as client:
+            openapi_resp = await client.get("/openapi.json")
+            if openapi_resp.status_code != 200:
+                return [
+                    Finding(
+                        check="openapi_available",
+                        severity="HIGH",
+                        message="Could not fetch /openapi.json (required for auto-discovery)",
+                        evidence={"status_code": openapi_resp.status_code, "body": openapi_resp.text[:500]},
+                    )
+                ]
+
+            discovered = discover_endpoints(openapi_resp.json())
+            write_eps = discovered["write_endpoints"]
+            admin_paths = discovered["admin_paths"] or cfg.get("admin_paths", ["/admin/secret"])
+            scan_paths = discovered["unauth_scan_paths"] or ["/health"]
+
+            findings: List[Finding] = []
+            findings += await check_write_requires_auth(client, write_eps, user_token=user_token, auth_header=auth_header)
+            findings += await check_no_sensitive_fields_for_unauth(client, sensitive_fields, scan_paths=scan_paths)
+            findings += await check_admin_routes_require_admin(client, admin_paths, user_token=user_token, auth_header=auth_header)
+            findings += await check_admin_routes_accessible_to_admin(client, admin_paths, admin_token=admin_token, auth_header=auth_header)
+            findings += await check_cors_not_wildcard_with_credentials(client, cors_cfg)
+            return findings
+
+
     transport = httpx.ASGITransport(app=app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test", timeout=15.0) as client:
         openapi_resp = await client.get("/openapi.json")
         if openapi_resp.status_code != 200:
             return [
@@ -117,9 +149,9 @@ async def run_all(config_path: str = "invariants.yml") -> List[Finding]:
         scan_paths = discovered["unauth_scan_paths"] or ["/health"]
 
         findings: List[Finding] = []
-        findings += await check_write_requires_auth(client, write_eps, user_token=user_token)
+        findings += await check_write_requires_auth(client, write_eps, user_token=user_token, auth_header=auth_header)
         findings += await check_no_sensitive_fields_for_unauth(client, sensitive_fields, scan_paths=scan_paths)
-        findings += await check_admin_routes_require_admin(client, admin_paths, user_token=user_token)
-        findings += await check_admin_routes_accessible_to_admin(client, admin_paths, admin_token=admin_token)
+        findings += await check_admin_routes_require_admin(client, admin_paths, user_token=user_token, auth_header=auth_header)
+        findings += await check_admin_routes_accessible_to_admin(client, admin_paths, admin_token=admin_token, auth_header=auth_header)
         findings += await check_cors_not_wildcard_with_credentials(client, cors_cfg)
         return findings
