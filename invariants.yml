@@ -1,0 +1,20 @@
+target:
+  app: "app.main:app"
+
+auth:
+  admin_token: "admin-token"
+  user_token: "user-token"
+
+sensitive_fields:
+  - email
+  - phone
+  - secret
+  - token
+  - password
+
+write_endpoints:
+  - method: POST
+    path: /items
+
+cors:
+  disallow_wildcard_with_credentials: true
